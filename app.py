@@ -28,6 +28,7 @@ from utils import (
     format_size,
     languages_to_percentages,
 )
+from analyzer import MAX_FILES_FOR_LOC, analyze_repository
 
 st.set_page_config(
     page_title="GitHub Repository Explorer",
@@ -89,6 +90,8 @@ with col2:
 # Persist results across reruns (e.g. when expanding the tree)
 if "repo_data" not in st.session_state:
     st.session_state.repo_data = None
+if "analysis_data" not in st.session_state:
+    st.session_state.analysis_data = None
 
 if fetch_clicked:
     if not repo_input.strip():
@@ -108,6 +111,7 @@ if fetch_clicked:
                 "truncated": truncated,
                 "fetched_at": datetime.utcnow().isoformat() + "Z",
             }
+            st.session_state.analysis_data = None  # new repo -> stale analysis
         except GitHubAPIError as e:
             st.session_state.repo_data = None
             st.error(str(e))
@@ -209,6 +213,94 @@ if data:
 
     st.divider()
 
+    # --- Phase 2: Code analysis ------------------------------------------
+    st.markdown("#### Code Analysis")
+    st.caption(
+        f"Downloads and inspects up to {MAX_FILES_FOR_LOC} files (smallest first) to keep "
+        "this fast and rate-limit friendly. `.git`, `node_modules`, `dist`, `build`, `venv` "
+        "and similar noise directories are skipped automatically."
+    )
+
+    if st.button("Analyze Code", type="primary"):
+        progress_bar = st.progress(0.0, text="Starting analysis...")
+
+        def _on_progress(done, total):
+            progress_bar.progress(
+                done / total if total else 1.0,
+                text=f"Reading files... {done}/{total}",
+            )
+
+        try:
+            analysis = analyze_repository(
+                info["owner"], info["name"], info["default_branch"],
+                tree, languages, progress_callback=_on_progress,
+            )
+            st.session_state.analysis_data = analysis
+        except Exception as e:  # noqa: BLE001 - surface any analysis failure to the user
+            st.error(f"Analysis failed: {e}")
+        finally:
+            progress_bar.empty()
+
+    analysis = st.session_state.analysis_data
+    if analysis:
+        loc = analysis["loc"]
+
+        # --- Output summary, matching the requested card layout ---------
+        category_label = " / ".join(analysis["categories"]) if analysis["categories"] else "Uncategorized"
+        framework_label = ", ".join(analysis["frameworks"]) if analysis["frameworks"] else "No framework detected"
+
+        st.markdown(
+            f"##### {framework_label} Project\n"
+            f"**{category_label}**"
+        )
+
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Files", format_number(analysis["file_count"]))
+        a2.metric("Lines of Code", format_number(loc["total_loc"]))
+        a3.metric("Components", format_number(analysis["components"]))
+        a4.metric("API Routes", format_number(analysis["api_routes"]))
+
+        st.caption(
+            f"Primary language: **{analysis['primary_language']}**  ·  "
+            f"Package manager: **{analysis['package_manager']}**  ·  "
+            f"Databases detected: **{', '.join(analysis['databases']) or 'None'}**"
+        )
+        if loc["sample_capped"]:
+            st.caption(
+                f"LOC is estimated from a sample of {loc['files_counted']} files "
+                f"(smallest-first) out of {analysis['file_count']} total — large repos are capped for speed."
+            )
+
+        detail_a, detail_b = st.columns(2)
+
+        with detail_a:
+            st.markdown("**File Type Distribution**")
+            dist = analysis["file_type_distribution"][:12]
+            st.bar_chart({row["extension"]: row["count"] for row in dist})
+            st.dataframe(
+                dist,
+                column_config={"extension": "Extension", "count": "Files", "language": "Language"},
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        with detail_b:
+            st.markdown("**Largest Files**")
+            st.dataframe(
+                [
+                    {"path": f["path"], "size": format_size(round(f.get("size", 0) / 1024, 1))}
+                    for f in analysis["largest_files"]
+                ],
+                column_config={"path": "File", "size": "Size"},
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        if analysis["manifests_checked"]:
+            st.caption(f"Manifest files inspected: {', '.join(analysis['manifests_checked'])}")
+
+    st.divider()
+
     # --- Download metadata ----------------------------------------------
     export_payload = {
         "repository": info,
@@ -216,6 +308,7 @@ if data:
         "file_tree": tree,
         "truncated": data["truncated"],
         "fetched_at": data["fetched_at"],
+        "code_analysis": st.session_state.analysis_data,
     }
     st.download_button(
         label="⬇️ Download repository metadata as JSON",
